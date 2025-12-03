@@ -1,9 +1,5 @@
-﻿using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.EntityFrameworkCore;
-using VtexCegid.Domain.Entities; // Tus entidades
-using System.Linq;
+﻿using Microsoft.EntityFrameworkCore;
+using Infrastructure.Persistence;
 
 public class InventorySyncWorker : BackgroundService
 {

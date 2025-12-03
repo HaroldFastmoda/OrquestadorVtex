@@ -1,33 +1,41 @@
-using Domain.Entities;
 using Microsoft.EntityFrameworkCore;
 using Polly;
+using Polly.Extensions.Http;
+
+using Infrastructure.Persistence;
+using Domain.Entities;
+
 var builder = Host.CreateApplicationBuilder(args);
 
 // ==========================================
 // 1. CONFIGURACIÓN DE SERVICIOS (DI)
 // ==========================================
 
-// Configuración de Entity Framework (Orchestrator DB)
+// Configuración de Entity Framework
+var connectionString = builder.Configuration.GetConnectionString("OrchestratorDb");
 builder.Services.AddDbContext<OrchestratorDbContext>(options =>
-    options.UseSqlServer(builder.Configuration.GetConnectionString("OrchestratorDb")));
+    options.UseMySql(connectionString, ServerVersion.AutoDetect(connectionString)));
 
-// Repositorios (Dapper para CEGID)
+// Repositorios
 builder.Services.AddSingleton<CegidRepository>();
 
-// Cliente HTTP para VTEX con Resiliencia (Polly)
+// Cliente HTTP para VTEX
 builder.Services.AddHttpClient<VtexApiService>(client =>
 {
     var vtexSettings = builder.Configuration.GetSection("VtexSettings");
-    client.BaseAddress = new Uri(vtexSettings["BaseUrl"]);
+
+    // Validación de nulos para evitar errores en tiempo de ejecución
+    string baseUrl = vtexSettings["BaseUrl"] ?? throw new ArgumentNullException("VtexSettings:BaseUrl no configurado");
+
+    client.BaseAddress = new Uri(baseUrl);
     client.DefaultRequestHeaders.Add("X-VTEX-API-AppKey", vtexSettings["AppKey"]);
     client.DefaultRequestHeaders.Add("X-VTEX-API-AppToken", vtexSettings["AppToken"]);
     client.DefaultRequestHeaders.Add("Accept", "application/json");
 })
 .AddPolicyHandler(GetRetryPolicy());
 
-// Registrar los Workers (Servicios en segundo plano)
+// Registrar los Workers
 builder.Services.AddHostedService<InventorySyncWorker>();
-// builder.Services.AddHostedService<OrderWorker>(); // Otros workers...
 
 // ==========================================
 // 2. CONSTRUCCIÓN DEL HOST
@@ -35,9 +43,8 @@ builder.Services.AddHostedService<InventorySyncWorker>();
 var host = builder.Build();
 
 // ==========================================
-// 3. SEEDING / MIGRACIÓN INICIAL (Lógica del TXT)
+// 3. SEEDING / CARGA INICIAL
 // ==========================================
-// Creamos un Scope temporal para obtener el DbContext y ejecutar la carga inicial
 using (var scope = host.Services.CreateScope())
 {
     var services = scope.ServiceProvider;
@@ -45,41 +52,40 @@ using (var scope = host.Services.CreateScope())
     {
         var context = services.GetRequiredService<OrchestratorDbContext>();
 
-        // Opcional: Ejecutar migraciones pendientes automáticamente al iniciar
-        // context.Database.Migrate();
+        // Crear la DB si no existe (útil para pruebas locales)
+        // context.Database.EnsureCreated(); 
 
-        // Verificamos si la tabla Inventories está vacía antes de cargar
         if (!context.Inventories.Any())
         {
             string fileName = "RelaciónSkuEan.txt";
 
-            // Asegúrate que el archivo se copie al directorio de salida en sus propiedades
             if (File.Exists(fileName))
             {
-                Console.WriteLine("Iniciando carga masiva de SKUs desde archivo...");
+                Console.WriteLine($"[SEED] Iniciando carga desde {fileName}...");
 
                 var lines = File.ReadAllLines(fileName);
                 var inventoriesToAdd = new List<Inventory>();
 
-                foreach (var line in lines.Skip(1)) // Saltar cabecera
+                foreach (var line in lines.Skip(1))
                 {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+
                     var parts = line.Split(',');
                     if (parts.Length >= 2)
                     {
                         var skuVtex = parts[0].Trim();
                         var eanCegid = parts[1].Trim();
 
-                        // Validación básica para evitar duplicados en el archivo
                         if (!string.IsNullOrEmpty(skuVtex) && !string.IsNullOrEmpty(eanCegid))
                         {
                             inventoriesToAdd.Add(new Inventory
                             {
                                 Sku = skuVtex,
                                 Ean = eanCegid,
-                                Name = "Carga Inicial " + DateTime.Now.ToShortDateString(),
+                                Name = "Carga Inicial",
                                 Units = 0,
-                                WarehouseId = 1, // ID Bodega Default
-                                StateId = 1,      // Activo
+                                WarehouseId = 1,
+                                StateId = 1,
                                 Reservation = 0,
                                 Price = 0
                             });
@@ -87,38 +93,31 @@ using (var scope = host.Services.CreateScope())
                     }
                 }
 
-                // Insertar por lotes (Bulk Insert implícito de EF)
                 if (inventoriesToAdd.Any())
                 {
                     context.Inventories.AddRange(inventoriesToAdd);
                     context.SaveChanges();
-                    Console.WriteLine($"Se cargaron {inventoriesToAdd.Count} SKUs exitosamente.");
+                    Console.WriteLine($"[SEED] Éxito: {inventoriesToAdd.Count} SKUs cargados.");
                 }
             }
             else
             {
-                Console.WriteLine($"Advertencia: No se encontró el archivo '{fileName}'. Se omitió la carga inicial.");
+                Console.WriteLine($"[SEED] Advertencia: No se encontró '{fileName}'. Asegúrate de copiarlo al directorio de salida.");
             }
         }
     }
     catch (Exception ex)
     {
-        // Loguear el error de migración pero no detener la app necesariamente
-        Console.WriteLine($"Error crítico durante el Seeding de datos: {ex.Message}");
+        Console.WriteLine($"[SEED] Error crítico: {ex.Message}");
     }
 }
 
-// ==========================================
-// 4. EJECUCIÓN
-// ==========================================
 host.Run();
 
-
-// Helper para políticas de reintento HTTP (Polly)
 static IAsyncPolicy<HttpResponseMessage> GetRetryPolicy()
 {
     return HttpPolicyExtensions
-        .HandleTransientHttpError() // Errores 5xx, 408 o fallos de red
+        .HandleTransientHttpError()
         .OrResult(msg => msg.StatusCode == System.Net.HttpStatusCode.NotFound)
         .WaitAndRetryAsync(3, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)));
 }
